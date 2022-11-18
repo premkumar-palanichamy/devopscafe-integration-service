@@ -1,0 +1,81 @@
+pipeline {
+    agent any
+    environment {
+        CI = 'true'
+    }
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        } 
+        stage('Build app') {
+            steps {
+                sh 'mvn clean compile package sonar:sonar'
+            }
+        }
+        stage('unit tests') {
+            steps {
+                sh 'mvn test'
+            }
+        }
+        stage('push artifacts') {
+            steps {
+                sh 'mvn upload -DrepoType=snapshot'
+            }
+        }
+        stage('Push artifacts - Release') {
+            when {
+                branch 'release' 
+            }
+            steps {
+                sh 'mvn upload -DrepoType=release'
+            }
+        }
+        stage('Deploy - Release') {
+            when {
+                branch 'release' 
+            }
+            steps {
+                // here pre-prod.ini is inventory for release branch, 
+                // it can be dynamic when integrated with cloud
+                sh '''
+                    ansible all -i pre-prod.ini deployment.yaml --extra-vers version=$(cat VERSION)
+                    custom-script-to-invoke-tests.sh
+                '''
+            }
+        }
+        stage('Push artifacts - Main') {
+            when {
+                branch 'main' 
+            }
+            steps {
+                sh 'mvn upload -DrepoType=prod'
+            }
+        }
+        stage('Deploy - prod') {
+            when {
+                branch 'main' 
+            }
+            steps {
+                // here prod.ini is inventory for release branch, 
+                // it can be dynamic when integrated with cloud
+                input message: 'Do you want to deploy to prod?(Click "Proceed" to continue)'
+                sh '''
+                    ansible all -i prod.ini deployment.yaml --extra-vers version=$(cat VERSION)
+                    custom-script-to-invoke-sanity-tests.sh    
+                '''
+            }
+        }
+    }
+    post { 
+        unsuccessful { 
+            // this can also be extended with attachments in-case 
+            // if the project has a requirements to receive result in mail
+            emailext body: 'Pipeline unsuccessful', recipientProviders: [developers(), requestor()], subject: 'Build job failed', to: 'team-dl@company.com'
+        }
+        success {
+            emailext body: 'Pipeline successful', recipientProviders: [developers(), requestor()], subject: 'Build job completed', to: 'team-dl@company.com'
+        }
+    }
+}

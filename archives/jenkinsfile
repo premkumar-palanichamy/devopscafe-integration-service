@@ -1,0 +1,191 @@
+pipeline {
+    parameters { booleanParam defaultValue: false, description: '', name: 'FORCE_DEPLOY' }
+
+    environment {
+        ARM_ACCESS_KEY = credentials('jenkins-arm-access-key')
+    }
+
+    options {
+        buildDiscarder logRotator(artifactDaysToKeepStr: '', artifactNumToKeepStr: '', daysToKeepStr: '', numToKeepStr: '5')
+        disableConcurrentBuilds()
+    }
+
+    agent {
+        kubernetes {
+            yamlFile "agent.yaml"
+        }
+    }
+
+    stages { 
+        stage('initStage') {
+            steps {
+                container('terraform') {
+                    echo 'Pulling...' + env.BRANCH_NAME
+                    sh '''#!/bin/bash -ex
+                        echo -e "placeHolderInitStage"
+                    '''
+                }
+            }
+        }
+
+        // This secion only runs for feature branches. Runs terraform plan and allows
+        // user to choose if they want to deploy
+        stage('featureBranch') {
+            when {
+                allOf {
+                    expression{!(env.BRANCH_NAME =~ /master/ )}
+                    expression{!(env.BRANCH_NAME =~ /PR/)}
+                    expression{!(env.BRANCH_NAME =~ /release/)}                
+                }
+            }
+            // environment { CLOUDENV = 'sbx' }
+            steps {
+                container('terraform') {
+                    withCredentials([azureServicePrincipal('8ae8bf0c-fb62-4dc0-87fe-dc2b3a29127d')]) {
+                        sh '''#!/bin/bash -e
+                            echo -e "\\e[31m============================================================\\e[30m"
+                            echo -e "THIS IS FEATURE BRANCH \\e[31m${BRANCH_NAME}\\e[30m"
+                            echo -e "\\e[31m============================================================\\e[30m"
+                            export ARM_CLIENT_ID=${AZURE_CLIENT_ID}
+                            export ARM_CLIENT_SECRET=${AZURE_CLIENT_SECRET}
+                            export ARM_SUBSCRIPTION_ID=${AZURE_SUBSCRIPTION_ID}
+                            export ARM_TENANT_ID=${AZURE_TENANT_ID}
+                            export TF_VAR_client_id=${AZURE_CLIENT_ID}
+                            export TF_VAR_client_secret=${AZURE_CLIENT_SECRET}
+                            cd Components/infra 
+
+                            echo -e "\\e[31m============================================================\\e[30m"
+                            echo -e "\\e[31mSet envs and TF Init\\e[30m"
+                            echo -e "\\e[31m============================================================\\e[30m"
+                            if [ -z "${CLOUDENV}" ]
+                            then
+                                echo "Environment not configured. Setting environemnt to sbx."
+                                export CLOUDENV=sbx
+                            fi
+                            . ../../setenv.bash ${CLOUDENV}
+                            terraform init -backend-config=${MYSTATE}
+                            sleep 5
+                            echo -e "\\e[31m============================================================\\e[30m"                
+                            echo -e "\\e[31mTF Validate\\e[30m"
+                            echo -e "\\e[31m============================================================\\e[30m"
+                            terraform validate
+                            sleep 5
+                            echo -e "\\e[31m============================================================\\e[30m"                
+                            echo -e "\\e[31mTF Plan\\e[30m"
+                            echo -e "\\e[31m============================================================\\e[30m"
+                            terraform plan -var-file ${MYTFVARS} -lock=false
+
+
+                            if [[ ${FORCE_DEPLOY} = "true" ]]
+                            then
+                                echo -e "\\e[31m============================================================\\e[30m"
+                                echo -e "\\e[31mUser requested Forced deploy in ${CLOUDENV} environment\\e[30m"
+                                echo -e "\\e[31m============================================================\\e[30m"
+                                terraform apply -var-file ${MYTFVARS} -auto-approve
+                            fi
+
+                            if [[ ${FORCE_DESTROY} = "true" ]]
+                            then
+                                echo -e "\\e[31m============================================================\\e[30m"
+                                echo -e "\\e[31mUser requested Forced destroy in ${CLOUDENV} environment\\e[30m"
+                                echo -e "\\e[31m============================================================\\e[30m"
+                                terraform destroy -var-file ${MYTFVARS} -auto-approve
+                            fi
+                        '''           
+                        }          
+                    }
+                }
+            }
+
+
+        // This section runs for pull requests to allow the reviewer
+        // to look at the results of th build
+        stage('pullRequest') {
+            when {
+                branch 'PR*'
+            }
+                steps {
+                    container('terraform') {
+                        withCredentials([azureServicePrincipal('8ae8bf0c-fb62-4dc0-87fe-dc2b3a29127d')]) {
+                            sh '''#!/bin/bash -e
+                                echo -e "\\e[31m========================================\\e[30m"
+                                echo -e "Creating plan for ${BRANCH_NAME}"
+                                echo -e "\\e[31m========================================\\e[30m"
+                                export ARM_CLIENT_ID=${AZURE_CLIENT_ID}
+                                export ARM_CLIENT_SECRET=${AZURE_CLIENT_SECRET}
+                                export ARM_SUBSCRIPTION_ID=${AZURE_SUBSCRIPTION_ID}
+                                export ARM_TENANT_ID=${AZURE_TENANT_ID}
+                                export TF_VAR_client_id=${AZURE_CLIENT_ID}
+                                export TF_VAR_client_secret=${AZURE_CLIENT_SECRET}
+                                cd Components/infra
+                                #export CLOUDENV=sbx
+                                 . ../../setenv.bash ${CLOUDENV}
+                                sleep 5
+                                terraform plan -var-file ${MYTFVARS}
+                                echo -e "\\e[31m========================================\\e[30m"
+                                echo -e "\\e[31mApplying terrafrom to ${CLOUDENV}\\e[30m"
+                                echo -e "\\e[31m========================================\\e[30m"
+                                terraform apply -var-file ${MYTFVARS}
+                            '''           
+                        }
+                    }
+                }
+        }
+
+
+        // This section deploys to cloud based on the release2TAG - dev/tst/prd
+        stage('deployToCloud') {
+            when {
+                    expression{(env.BRANCH_NAME =~ /release2*/)}                
+            }
+            steps {
+                container('terraform') {
+                    withCredentials([azureServicePrincipal('8ae8bf0c-fb62-4dc0-87fe-dc2b3a29127d')]) {
+
+                        sh '''#!/bin/bash -xe
+                            #export CLOUDENV=$(echo $BRANCH_NAME | cut -f2 -d"2")
+                            echo -e "\\e[31m========================================\\e[30m"
+                            echo Deploying to ${CLOUDENV}
+                            echo -e "\\e[31m========================================\\e[30m"
+                            export ARM_CLIENT_ID=${AZURE_CLIENT_ID}
+                            export ARM_CLIENT_SECRET=${AZURE_CLIENT_SECRET}
+                            export ARM_SUBSCRIPTION_ID=${AZURE_SUBSCRIPTION_ID}
+                            export ARM_TENANT_ID=${AZURE_TENANT_ID}
+                            export TF_VAR_client_id=${AZURE_CLIENT_ID}
+                            export TF_VAR_client_secret=${AZURE_CLIENT_SECRET}
+                            cd Components/network
+                            . ../../setenv.bash ${CLOUDENV}  
+                            echo -e "\\e[31mValidating\\e[30m"
+                            terraform init -backend-config=${MYSTATE}
+                            terraform validate
+                            terraform plan -var-file ${MYTFVARS}
+                        '''           
+
+                        // script {
+                        //     timeout(10) {
+                        //         input message: 'Check PLAN output, are you sure you want to deploy to cloud environment ?', 
+                        //         ok: 'DEPLOY'
+                        //     }
+                        // }
+
+                        sh '''#!/bin/bash -e
+                            #export CLOUDENV=$(echo $BRANCH_NAME | cut -f2 -d"2")
+                            export ARM_CLIENT_ID=${AZURE_CLIENT_ID}
+                            export ARM_CLIENT_SECRET=${AZURE_CLIENT_SECRET}
+                            export ARM_SUBSCRIPTION_ID=${AZURE_SUBSCRIPTION_ID}
+                            export ARM_TENANT_ID=${AZURE_TENANT_ID}
+                            export TF_VAR_client_id=${AZURE_CLIENT_ID}
+                            export TF_VAR_client_secret=${AZURE_CLIENT_SECRET}
+                            cd Components/network
+                            . ../../setenv.bash ${CLOUDENV}  
+                            #terraform apply -var-file ${MYTFVARS} -auto-approve
+                        '''      
+                    }          
+                }
+            }
+        }
+    }
+}
+
+
+
